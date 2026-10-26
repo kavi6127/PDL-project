@@ -1,0 +1,2970 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+
+#include "MAX30105.h"
+#include "heartRate.h"
+
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#include <OneWire.h>
+#include <DallasTemperature.h>
+
+#include <TinyGPSPlus.h>
+
+// =====================================================
+// WIFI ACCESS POINT
+// =====================================================
+
+const char* apSSID = "ESP32-Health-Monitor";
+const char* apPassword = "health123";
+
+WebServer server(80);
+
+// =====================================================
+// ALERT LIMITS
+// =====================================================
+
+const float TEMP_HIGH_LIMIT = 33.0;
+
+const float HR_LOW_LIMIT = 50.0;
+const float HR_HIGH_LIMIT = 120.0;
+
+const byte ABNORMAL_BEATS_REQUIRED = 2;
+const byte NORMAL_BEATS_TO_CLEAR = 2;
+
+// =====================================================
+// OLED
+// =====================================================
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  OLED_RESET
+);
+
+// =====================================================
+// MAX30102
+// =====================================================
+
+MAX30105 particleSensor;
+
+unsigned long lastBeat = 0;
+
+long irValue = 0;
+
+bool fingerDetected = false;
+
+float currentBPM = 0;
+float displayBPM = 0;
+
+byte validBeatCount = 0;
+
+// =====================================================
+// HEART RATE ALERT
+// =====================================================
+
+byte lowBeatCount = 0;
+byte highBeatCount = 0;
+byte normalBeatCount = 0;
+
+bool lowHRAlert = false;
+bool highHRAlert = false;
+
+// =====================================================
+// KY-001 / DS18B20
+// =====================================================
+
+#define ONE_WIRE_BUS 4
+
+OneWire oneWire(ONE_WIRE_BUS);
+
+DallasTemperature tempSensor(&oneWire);
+
+float temperatureC = 0;
+
+bool temperatureValid = false;
+
+unsigned long lastTempRequest = 0;
+
+bool tempConversionStarted = false;
+
+bool tempAlert = false;
+
+// =====================================================
+// NEO-6M GPS
+// =====================================================
+
+#define GPS_RX_PIN 16
+#define GPS_TX_PIN 17
+
+HardwareSerial GPSserial(2);
+
+TinyGPSPlus gps;
+
+bool gpsFix = false;
+
+double gpsLatitude = 0;
+double gpsLongitude = 0;
+
+double gpsAltitude = 0;
+
+uint32_t gpsSatellites = 0;
+
+double gpsHDOP = 0;
+
+unsigned long lastGpsDebug = 0;
+
+// =====================================================
+// OLED TIMER
+// =====================================================
+
+unsigned long lastDisplayUpdate = 0;
+
+// =====================================================
+// WEB PAGE
+// =====================================================
+
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+
+<html lang="en">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+name="viewport"
+content="width=device-width, initial-scale=1.0">
+
+<title>ESP32 Health Monitor</title>
+
+<style>
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+
+  font-family:
+    Arial,
+    Helvetica,
+    sans-serif;
+
+  background:
+    linear-gradient(
+      135deg,
+      #07111f,
+      #10243d,
+      #173b5f
+    );
+
+  color: white;
+
+  min-height: 100vh;
+}
+
+.container {
+  width: 94%;
+
+  max-width: 950px;
+
+  margin: auto;
+
+  padding:
+    25px
+    8px
+    40px;
+}
+
+.header {
+  text-align: center;
+
+  margin-bottom: 22px;
+}
+
+.header h1 {
+  margin: 0;
+
+  font-size: 28px;
+
+  letter-spacing: 1px;
+}
+
+.header p {
+  margin-top: 8px;
+
+  color: #a8bdd0;
+}
+
+.connection {
+  margin-top: 12px;
+
+  display: inline-flex;
+
+  align-items: center;
+
+  gap: 8px;
+
+  background:
+    rgba(
+      255,
+      255,
+      255,
+      0.08
+    );
+
+  border-radius: 25px;
+
+  padding:
+    8px
+    15px;
+
+  font-size: 13px;
+}
+
+.dot {
+  width: 10px;
+
+  height: 10px;
+
+  background: #31e89b;
+
+  border-radius: 50%;
+
+  box-shadow:
+    0 0 8px
+    #31e89b;
+}
+
+.alertBox {
+  display: none;
+
+  margin-bottom: 18px;
+
+  padding: 18px;
+
+  text-align: center;
+
+  border-radius: 18px;
+
+  background:
+    rgba(
+      255,
+      60,
+      75,
+      0.18
+    );
+
+  border:
+    1px solid
+    #ff5364;
+
+  color: #ff929e;
+}
+
+.alertTitle {
+  font-size: 22px;
+
+  font-weight: bold;
+
+  margin-bottom: 8px;
+}
+
+.alertMessage {
+  font-size: 17px;
+
+  font-weight: bold;
+}
+
+.grid {
+  display: grid;
+
+  grid-template-columns:
+    repeat(2,1fr);
+
+  gap: 16px;
+}
+
+.card {
+  background:
+    rgba(
+      255,
+      255,
+      255,
+      0.08
+    );
+
+  border:
+    1px solid
+    rgba(
+      255,
+      255,
+      255,
+      0.12
+    );
+
+  border-radius: 20px;
+
+  padding: 20px;
+}
+
+.cardTitle {
+  font-size: 13px;
+
+  color: #aac0d4;
+
+  letter-spacing: 1px;
+}
+
+.value {
+  margin-top: 14px;
+
+  font-size: 47px;
+
+  font-weight: bold;
+}
+
+.heartValue {
+  color: #ff6978;
+}
+
+.tempValue {
+  color: #55caff;
+}
+
+.unit {
+  font-size: 17px;
+
+  color: #a9bdd0;
+
+  margin-left: 4px;
+}
+
+.sensorInfo {
+  margin-top: 17px;
+
+  padding-top: 14px;
+
+  border-top:
+    1px solid
+    rgba(
+      255,
+      255,
+      255,
+      0.10
+    );
+
+  display: flex;
+
+  justify-content: space-between;
+
+  gap: 10px;
+
+  color: #a9bdcf;
+
+  font-size: 13px;
+}
+
+.statusCard {
+  margin-top: 16px;
+}
+
+.statusRow {
+  display: flex;
+
+  justify-content:
+    space-between;
+
+  align-items: center;
+
+  gap: 15px;
+
+  flex-wrap: wrap;
+}
+
+.statusText {
+  margin-top: 8px;
+
+  font-size: 18px;
+}
+
+.badge {
+  padding:
+    9px
+    18px;
+
+  border-radius: 25px;
+
+  font-weight: bold;
+
+  font-size: 13px;
+}
+
+.normal {
+  color: #41ef98;
+
+  border:
+    1px solid
+    #41ef98;
+
+  background:
+    rgba(
+      40,
+      230,
+      140,
+      0.12
+    );
+}
+
+.warning {
+  color: #ff6b79;
+
+  border:
+    1px solid
+    #ff6b79;
+
+  background:
+    rgba(
+      255,
+      70,
+      85,
+      0.14
+    );
+}
+
+.gpsCard {
+  margin-top: 16px;
+}
+
+.gpsHeader {
+  display: flex;
+
+  justify-content:
+    space-between;
+
+  align-items: center;
+
+  margin-bottom: 20px;
+}
+
+.gpsStatus {
+  padding:
+    7px
+    14px;
+
+  border-radius: 20px;
+
+  font-size: 12px;
+
+  font-weight: bold;
+}
+
+.gpsSearching {
+  color: #ffc857;
+
+  border:
+    1px solid
+    #ffc857;
+}
+
+.gpsFixed {
+  color: #41ef98;
+
+  border:
+    1px solid
+    #41ef98;
+}
+
+.gpsGrid {
+  display: grid;
+
+  grid-template-columns:
+    repeat(2,1fr);
+
+  gap: 12px;
+}
+
+.gpsItem {
+  background:
+    rgba(
+      255,
+      255,
+      255,
+      0.05
+    );
+
+  border-radius: 14px;
+
+  padding: 15px;
+}
+
+.gpsLabel {
+  color: #8fa8bc;
+
+  font-size: 12px;
+
+  margin-bottom: 6px;
+}
+
+.gpsValue {
+  font-size: 18px;
+
+  font-weight: bold;
+
+  overflow-wrap: anywhere;
+}
+
+.chartCard {
+  margin-top: 16px;
+}
+
+canvas {
+  width: 100%;
+
+  height: 160px;
+
+  display: block;
+
+  margin-top: 15px;
+}
+
+.thresholdBox {
+  margin-top: 16px;
+
+  padding: 15px;
+
+  border-radius: 14px;
+
+  background:
+    rgba(
+      255,
+      255,
+      255,
+      0.05
+    );
+
+  color: #aec0d0;
+
+  font-size: 13px;
+
+  line-height: 1.8;
+}
+
+.footer {
+  text-align: center;
+
+  margin-top: 22px;
+
+  color: #72899d;
+
+  font-size: 12px;
+}
+
+@media(max-width:600px) {
+
+  .grid {
+    grid-template-columns: 1fr;
+  }
+
+  .gpsGrid {
+    grid-template-columns: 1fr;
+  }
+
+  .header h1 {
+    font-size: 23px;
+  }
+
+  .value {
+    font-size: 42px;
+  }
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="container">
+
+
+<div class="header">
+
+<h1>Smart Health Monitor</h1>
+
+<p>
+ESP32 Real-Time Monitoring System
+</p>
+
+<div class="connection">
+
+<span class="dot"></span>
+
+<span id="connectionText">
+Connecting...
+</span>
+
+</div>
+
+</div>
+
+
+<div
+id="alertBox"
+class="alertBox">
+
+<div class="alertTitle">
+WARNING
+</div>
+
+<div
+id="alertMessage"
+class="alertMessage">
+</div>
+
+</div>
+
+
+<div class="grid">
+
+
+<div class="card">
+
+<div class="cardTitle">
+HEART RATE
+</div>
+
+<div>
+
+<span
+id="heartRate"
+class="value heartValue">
+
+--
+
+</span>
+
+<span class="unit">
+BPM
+</span>
+
+</div>
+
+<div class="sensorInfo">
+
+<span>
+MAX30102
+</span>
+
+<span id="fingerStatus">
+Place finger
+</span>
+
+</div>
+
+<div class="sensorInfo">
+
+<span>
+Latest Beat
+</span>
+
+<span id="rawBPM">
+--
+</span>
+
+</div>
+
+</div>
+
+
+<div class="card">
+
+<div class="cardTitle">
+TEMPERATURE
+</div>
+
+<div>
+
+<span
+id="temperature"
+class="value tempValue">
+
+--
+
+</span>
+
+<span class="unit">
+C
+</span>
+
+</div>
+
+<div class="sensorInfo">
+
+<span>
+KY-001
+</span>
+
+<span>
+High limit: 33 C
+</span>
+
+</div>
+
+</div>
+
+
+</div>
+
+
+<div class="card statusCard">
+
+<div class="statusRow">
+
+<div>
+
+<div class="cardTitle">
+SYSTEM STATUS
+</div>
+
+<div
+id="statusText"
+class="statusText">
+
+Starting...
+
+</div>
+
+</div>
+
+
+<div
+id="statusBadge"
+class="badge normal">
+
+NORMAL
+
+</div>
+
+</div>
+
+</div>
+
+
+<div class="card gpsCard">
+
+
+<div class="gpsHeader">
+
+<div class="cardTitle">
+GPS LOCATION
+</div>
+
+<div
+id="gpsStatus"
+class="gpsStatus gpsSearching">
+
+SEARCHING
+
+</div>
+
+</div>
+
+
+<div class="gpsGrid">
+
+
+<div class="gpsItem">
+
+<div class="gpsLabel">
+LATITUDE
+</div>
+
+<div
+id="latitude"
+class="gpsValue">
+
+--
+
+</div>
+
+</div>
+
+
+<div class="gpsItem">
+
+<div class="gpsLabel">
+LONGITUDE
+</div>
+
+<div
+id="longitude"
+class="gpsValue">
+
+--
+
+</div>
+
+</div>
+
+
+<div class="gpsItem">
+
+<div class="gpsLabel">
+SATELLITES
+</div>
+
+<div
+id="satellites"
+class="gpsValue">
+
+--
+
+</div>
+
+</div>
+
+
+<div class="gpsItem">
+
+<div class="gpsLabel">
+ALTITUDE
+</div>
+
+<div
+id="altitude"
+class="gpsValue">
+
+--
+
+</div>
+
+</div>
+
+
+</div>
+
+</div>
+
+
+<div class="card chartCard">
+
+<div class="cardTitle">
+HEART RATE TREND
+</div>
+
+<canvas
+id="hrChart"
+width="800"
+height="180">
+</canvas>
+
+</div>
+
+
+<div class="card chartCard">
+
+<div class="cardTitle">
+TEMPERATURE TREND
+</div>
+
+<canvas
+id="tempChart"
+width="800"
+height="180">
+</canvas>
+
+</div>
+
+
+<div class="thresholdBox">
+
+Heart-rate low alert:
+below 50 BPM
+
+<br>
+
+Heart-rate high alert:
+above 120 BPM
+
+<br>
+
+Temperature alert:
+above 33 C
+
+<br>
+
+GPS uses NEO-6M UART2.
+
+</div>
+
+
+<div class="footer">
+
+ESP32 Health Monitor
+
+<br>
+
+MAX30102 + KY-001 + NEO-6M + OLED
+
+</div>
+
+
+</div>
+
+
+<script>
+
+const heartHistory = [];
+
+const tempHistory = [];
+
+const MAX_POINTS = 40;
+
+
+function drawChart(
+  canvasId,
+  values,
+  minimum,
+  maximum,
+  lineColor
+)
+{
+
+  const canvas =
+    document.getElementById(
+      canvasId
+    );
+
+  const ctx =
+    canvas.getContext(
+      "2d"
+    );
+
+  const width =
+    canvas.width;
+
+  const height =
+    canvas.height;
+
+
+  ctx.clearRect(
+    0,
+    0,
+    width,
+    height
+  );
+
+
+  ctx.strokeStyle =
+    "rgba(255,255,255,0.08)";
+
+  ctx.lineWidth = 1;
+
+
+  for(
+    let i=1;
+    i<5;
+    i++
+  )
+  {
+
+    const y =
+      height *
+      i /
+      5;
+
+
+    ctx.beginPath();
+
+    ctx.moveTo(
+      0,
+      y
+    );
+
+    ctx.lineTo(
+      width,
+      y
+    );
+
+    ctx.stroke();
+
+  }
+
+
+  if(
+    values.length < 2
+  )
+  {
+    return;
+  }
+
+
+  ctx.strokeStyle =
+    lineColor;
+
+  ctx.lineWidth = 4;
+
+  ctx.lineJoin =
+    "round";
+
+  ctx.lineCap =
+    "round";
+
+
+  ctx.beginPath();
+
+
+  for(
+    let index=0;
+    index<values.length;
+    index++
+  )
+  {
+
+    const value =
+      values[index];
+
+
+    const x =
+      index *
+      width /
+      (MAX_POINTS-1);
+
+
+    let normalized =
+      (
+        value -
+        minimum
+      )
+      /
+      (
+        maximum -
+        minimum
+      );
+
+
+    normalized =
+      Math.max(
+        0,
+        Math.min(
+          1,
+          normalized
+        )
+      );
+
+
+    const y =
+      height -
+      (
+        normalized *
+        (height-20)
+      )
+      -
+      10;
+
+
+    if(
+      index === 0
+    )
+    {
+
+      ctx.moveTo(
+        x,
+        y
+      );
+
+    }
+    else
+    {
+
+      ctx.lineTo(
+        x,
+        y
+      );
+
+    }
+
+  }
+
+
+  ctx.stroke();
+
+}
+
+
+async function updateDashboard()
+{
+
+  try
+  {
+
+    const response =
+      await fetch(
+        "/data",
+        {
+          cache:
+            "no-store"
+        }
+      );
+
+
+    if(
+      !response.ok
+    )
+    {
+      throw new Error(
+        "Connection error"
+      );
+    }
+
+
+    const data =
+      await response.json();
+
+
+    // ==================================
+    // HEART RATE
+    // ==================================
+
+    if(
+      data.finger &&
+      data.bpm > 0
+    )
+    {
+
+      document.getElementById(
+        "heartRate"
+      ).textContent =
+        Math.round(
+          data.bpm
+        );
+
+
+      document.getElementById(
+        "rawBPM"
+      ).textContent =
+        Math.round(
+          data.rawBpm
+        )
+        +
+        " BPM";
+
+
+      document.getElementById(
+        "fingerStatus"
+      ).textContent =
+        "Finger detected";
+
+
+      heartHistory.push(
+        data.bpm
+      );
+
+    }
+    else
+    {
+
+      document.getElementById(
+        "heartRate"
+      ).textContent =
+        "--";
+
+
+      document.getElementById(
+        "rawBPM"
+      ).textContent =
+        "--";
+
+
+      document.getElementById(
+        "fingerStatus"
+      ).textContent =
+        "Place finger";
+
+    }
+
+
+    // ==================================
+    // TEMPERATURE
+    // ==================================
+
+    if(
+      data.tempValid
+    )
+    {
+
+      document.getElementById(
+        "temperature"
+      ).textContent =
+        Number(
+          data.temp
+        ).toFixed(1);
+
+
+      tempHistory.push(
+        Number(
+          data.temp
+        )
+      );
+
+    }
+    else
+    {
+
+      document.getElementById(
+        "temperature"
+      ).textContent =
+        "--";
+
+    }
+
+
+    if(
+      heartHistory.length >
+      MAX_POINTS
+    )
+    {
+
+      heartHistory.shift();
+
+    }
+
+
+    if(
+      tempHistory.length >
+      MAX_POINTS
+    )
+    {
+
+      tempHistory.shift();
+
+    }
+
+
+    drawChart(
+      "hrChart",
+      heartHistory,
+      30,
+      150,
+      "#ff6978"
+    );
+
+
+    drawChart(
+      "tempChart",
+      tempHistory,
+      20,
+      40,
+      "#55caff"
+    );
+
+
+    // ==================================
+    // GPS
+    // ==================================
+
+    const gpsStatus =
+      document.getElementById(
+        "gpsStatus"
+      );
+
+
+    if(
+      data.gpsFix
+    )
+    {
+
+      gpsStatus.textContent =
+        "GPS FIXED";
+
+
+      gpsStatus.className =
+        "gpsStatus gpsFixed";
+
+
+      document.getElementById(
+        "latitude"
+      ).textContent =
+        Number(
+          data.latitude
+        ).toFixed(6);
+
+
+      document.getElementById(
+        "longitude"
+      ).textContent =
+        Number(
+          data.longitude
+        ).toFixed(6);
+
+
+      document.getElementById(
+        "satellites"
+      ).textContent =
+        data.satellites;
+
+
+      document.getElementById(
+        "altitude"
+      ).textContent =
+        Number(
+          data.altitude
+        ).toFixed(1)
+        +
+        " m";
+
+    }
+    else
+    {
+
+      gpsStatus.textContent =
+        "SEARCHING";
+
+
+      gpsStatus.className =
+        "gpsStatus gpsSearching";
+
+
+      document.getElementById(
+        "latitude"
+      ).textContent =
+        "--";
+
+
+      document.getElementById(
+        "longitude"
+      ).textContent =
+        "--";
+
+
+      document.getElementById(
+        "satellites"
+      ).textContent =
+        data.satellites;
+
+
+      document.getElementById(
+        "altitude"
+      ).textContent =
+        "--";
+
+    }
+
+
+    // ==================================
+    // ALERTS
+    // ==================================
+
+    const alertBox =
+      document.getElementById(
+        "alertBox"
+      );
+
+
+    const statusText =
+      document.getElementById(
+        "statusText"
+      );
+
+
+    const statusBadge =
+      document.getElementById(
+        "statusBadge"
+      );
+
+
+    if(
+      data.alert
+    )
+    {
+
+      alertBox.style.display =
+        "block";
+
+
+      document.getElementById(
+        "alertMessage"
+      ).textContent =
+        data.message;
+
+
+      statusText.textContent =
+        data.message;
+
+
+      statusBadge.textContent =
+        "ALERT";
+
+
+      statusBadge.className =
+        "badge warning";
+
+    }
+    else
+    {
+
+      alertBox.style.display =
+        "none";
+
+
+      if(
+        !data.finger
+      )
+      {
+
+        statusText.textContent =
+          "Waiting for heart-rate measurement";
+
+      }
+      else
+      {
+
+        statusText.textContent =
+          "All measured parameters normal";
+
+      }
+
+
+      statusBadge.textContent =
+        "NORMAL";
+
+
+      statusBadge.className =
+        "badge normal";
+
+    }
+
+
+    document.getElementById(
+      "connectionText"
+    ).textContent =
+      "ESP32 Connected";
+
+  }
+  catch(error)
+  {
+
+    document.getElementById(
+      "connectionText"
+    ).textContent =
+      "Connection Lost";
+
+  }
+
+}
+
+
+setInterval(
+  updateDashboard,
+  500
+);
+
+
+updateDashboard();
+
+</script>
+
+</body>
+
+</html>
+)rawliteral";
+
+
+// =====================================================
+// WEB ROOT
+// =====================================================
+
+void handleRoot()
+{
+
+  server.send_P(
+    200,
+    "text/html; charset=UTF-8",
+    index_html
+  );
+
+}
+
+
+// =====================================================
+// JSON SENSOR DATA
+// =====================================================
+
+void handleData()
+{
+
+  String alertMessage =
+    "NORMAL";
+
+
+  if(
+    tempAlert &&
+    lowHRAlert
+  )
+  {
+
+    alertMessage =
+      "HIGH TEMPERATURE AND LOW HEART RATE";
+
+  }
+
+  else if(
+    tempAlert &&
+    highHRAlert
+  )
+  {
+
+    alertMessage =
+      "HIGH TEMPERATURE AND HIGH HEART RATE";
+
+  }
+
+  else if(
+    tempAlert
+  )
+  {
+
+    alertMessage =
+      "HIGH TEMPERATURE";
+
+  }
+
+  else if(
+    lowHRAlert
+  )
+  {
+
+    alertMessage =
+      "LOW HEART RATE";
+
+  }
+
+  else if(
+    highHRAlert
+  )
+  {
+
+    alertMessage =
+      "HIGH HEART RATE";
+
+  }
+
+
+  bool anyAlert =
+    tempAlert ||
+    lowHRAlert ||
+    highHRAlert;
+
+
+  String json =
+    "{";
+
+
+  // Temperature
+
+  json +=
+    "\"temp\":";
+
+  json +=
+    String(
+      temperatureC,
+      1
+    );
+
+
+  json +=
+    ",\"tempValid\":";
+
+  json +=
+    temperatureValid
+    ?
+    "true"
+    :
+    "false";
+
+
+  // Heart rate
+
+  json +=
+    ",\"bpm\":";
+
+  json +=
+    String(
+      displayBPM,
+      1
+    );
+
+
+  json +=
+    ",\"rawBpm\":";
+
+  json +=
+    String(
+      currentBPM,
+      1
+    );
+
+
+  json +=
+    ",\"finger\":";
+
+  json +=
+    fingerDetected
+    ?
+    "true"
+    :
+    "false";
+
+
+  // GPS
+
+  json +=
+    ",\"gpsFix\":";
+
+  json +=
+    gpsFix
+    ?
+    "true"
+    :
+    "false";
+
+
+  json +=
+    ",\"latitude\":";
+
+  json +=
+    String(
+      gpsLatitude,
+      6
+    );
+
+
+  json +=
+    ",\"longitude\":";
+
+  json +=
+    String(
+      gpsLongitude,
+      6
+    );
+
+
+  json +=
+    ",\"satellites\":";
+
+  json +=
+    String(
+      gpsSatellites
+    );
+
+
+  json +=
+    ",\"altitude\":";
+
+  json +=
+    String(
+      gpsAltitude,
+      1
+    );
+
+
+  // Alert
+
+  json +=
+    ",\"alert\":";
+
+  json +=
+    anyAlert
+    ?
+    "true"
+    :
+    "false";
+
+
+  json +=
+    ",\"message\":\"";
+
+  json +=
+    alertMessage;
+
+  json +=
+    "\"";
+
+
+  json +=
+    "}";
+
+
+  server.sendHeader(
+    "Cache-Control",
+    "no-store"
+  );
+
+
+  server.send(
+    200,
+    "application/json",
+    json
+  );
+
+}
+
+
+// =====================================================
+// SETUP
+// =====================================================
+
+void setup()
+{
+
+  Serial.begin(
+    115200
+  );
+
+
+  delay(
+    500
+  );
+
+
+  // ===================================================
+  // I2C
+  // ===================================================
+
+  Wire.begin(
+    21,
+    22
+  );
+
+
+  // ===================================================
+  // GPS UART2
+  // ===================================================
+
+  GPSserial.begin(
+    9600,
+    SERIAL_8N1,
+    GPS_RX_PIN,
+    GPS_TX_PIN
+  );
+
+
+  Serial.println(
+    "NEO-6M GPS UART started"
+  );
+
+
+  // ===================================================
+  // OLED
+  // ===================================================
+
+  if(
+    !display.begin(
+      SSD1306_SWITCHCAPVCC,
+      0x3C
+    )
+  )
+  {
+
+    Serial.println(
+      "OLED ERROR"
+    );
+
+
+    while(true)
+    {
+    }
+
+  }
+
+
+  display.clearDisplay();
+
+
+  display.setTextColor(
+    SSD1306_WHITE
+  );
+
+
+  display.setTextSize(
+    1
+  );
+
+
+  display.setCursor(
+    0,
+    0
+  );
+
+
+  display.println(
+    "HEALTH MONITOR"
+  );
+
+
+  display.println();
+
+
+  display.println(
+    "Starting..."
+  );
+
+
+  display.display();
+
+
+  // ===================================================
+  // KY-001
+  // ===================================================
+
+  tempSensor.begin();
+
+
+  tempSensor.setResolution(
+    10
+  );
+
+
+  tempSensor.setWaitForConversion(
+    false
+  );
+
+
+  tempSensor.requestTemperatures();
+
+
+  tempConversionStarted =
+    true;
+
+
+  lastTempRequest =
+    millis();
+
+
+  // ===================================================
+  // MAX30102
+  // ===================================================
+
+  if(
+    !particleSensor.begin(
+      Wire,
+      I2C_SPEED_FAST
+    )
+  )
+  {
+
+    Serial.println(
+      "MAX30102 ERROR"
+    );
+
+
+    display.clearDisplay();
+
+
+    display.setCursor(
+      0,
+      0
+    );
+
+
+    display.println(
+      "MAX30102 ERROR"
+    );
+
+
+    display.display();
+
+
+    while(true)
+    {
+    }
+
+  }
+
+
+  particleSensor.setup(
+    30,
+    4,
+    2,
+    100,
+    411,
+    8192
+  );
+
+
+  // ===================================================
+  // ESP32 WIFI ACCESS POINT
+  // ===================================================
+
+  WiFi.mode(
+    WIFI_AP
+  );
+
+
+  WiFi.softAP(
+    apSSID,
+    apPassword
+  );
+
+
+  IPAddress IP =
+    WiFi.softAPIP();
+
+
+  Serial.println();
+
+  Serial.println(
+    "================================"
+  );
+
+
+  Serial.println(
+    "ESP32 HEALTH MONITOR"
+  );
+
+
+  Serial.println(
+    "================================"
+  );
+
+
+  Serial.print(
+    "WiFi Name : "
+  );
+
+
+  Serial.println(
+    apSSID
+  );
+
+
+  Serial.print(
+    "Password  : "
+  );
+
+
+  Serial.println(
+    apPassword
+  );
+
+
+  Serial.print(
+    "Dashboard : http://"
+  );
+
+
+  Serial.println(
+    IP
+  );
+
+
+  Serial.println(
+    "GPS RX GPIO16"
+  );
+
+
+  Serial.println(
+    "GPS TX GPIO17"
+  );
+
+
+  Serial.println(
+    "================================"
+  );
+
+
+  // ===================================================
+  // WEB SERVER
+  // ===================================================
+
+  server.on(
+    "/",
+    handleRoot
+  );
+
+
+  server.on(
+    "/data",
+    handleData
+  );
+
+
+  server.begin();
+
+
+  // ===================================================
+  // STARTUP OLED
+  // ===================================================
+
+  display.clearDisplay();
+
+
+  display.setCursor(
+    0,
+    0
+  );
+
+
+  display.println(
+    "WiFi READY"
+  );
+
+
+  display.println();
+
+
+  display.println(
+    "ESP32-Health-Monitor"
+  );
+
+
+  display.println();
+
+
+  display.println(
+    "192.168.4.1"
+  );
+
+
+  display.println(
+    "GPS starting..."
+  );
+
+
+  display.display();
+
+
+  delay(
+    2500
+  );
+
+}
+
+
+// =====================================================
+// LOOP
+// =====================================================
+
+void loop()
+{
+
+  // ===================================================
+  // READ GPS CONTINUOUSLY
+  // ===================================================
+
+  while(
+    GPSserial.available() >
+    0
+  )
+  {
+
+    char c =
+      GPSserial.read();
+
+
+    gps.encode(
+      c
+    );
+
+  }
+
+
+  // Current GPS fix only considered valid
+  // if location data is recent.
+
+  gpsFix =
+    gps.location.isValid()
+    &&
+    gps.location.age() <
+    5000;
+
+
+  if(
+    gpsFix
+  )
+  {
+
+    gpsLatitude =
+      gps.location.lat();
+
+
+    gpsLongitude =
+      gps.location.lng();
+
+  }
+
+
+  if(
+    gps.satellites.isValid()
+  )
+  {
+
+    gpsSatellites =
+      gps.satellites.value();
+
+  }
+
+
+  if(
+    gps.altitude.isValid()
+  )
+  {
+
+    gpsAltitude =
+      gps.altitude.meters();
+
+  }
+
+
+  if(
+    gps.hdop.isValid()
+  )
+  {
+
+    gpsHDOP =
+      gps.hdop.hdop();
+
+  }
+
+
+  // GPS serial diagnostic once every 2 seconds
+
+  if(
+    millis() -
+    lastGpsDebug >=
+    2000
+  )
+  {
+
+    lastGpsDebug =
+      millis();
+
+
+    Serial.print(
+      "GPS Fix: "
+    );
+
+
+    Serial.print(
+      gpsFix
+      ?
+      "YES"
+      :
+      "NO"
+    );
+
+
+    Serial.print(
+      " | Satellites: "
+    );
+
+
+    Serial.print(
+      gpsSatellites
+    );
+
+
+    if(
+      gpsFix
+    )
+    {
+
+      Serial.print(
+        " | LAT: "
+      );
+
+
+      Serial.print(
+        gpsLatitude,
+        6
+      );
+
+
+      Serial.print(
+        " | LON: "
+      );
+
+
+      Serial.print(
+        gpsLongitude,
+        6
+      );
+
+
+      Serial.print(
+        " | ALT: "
+      );
+
+
+      Serial.print(
+        gpsAltitude,
+        1
+      );
+
+
+      Serial.print(
+        " m"
+      );
+
+    }
+
+
+    Serial.println();
+
+  }
+
+
+  // ===================================================
+  // WEB SERVER
+  // ===================================================
+
+  server.handleClient();
+
+
+  // ===================================================
+  // MAX30102
+  // ===================================================
+
+  irValue =
+    particleSensor.getIR();
+
+
+  fingerDetected =
+    irValue >
+    20000;
+
+
+  if(
+    fingerDetected
+  )
+  {
+
+    if(
+      checkForBeat(
+        irValue
+      )
+    )
+    {
+
+      unsigned long now =
+        millis();
+
+
+      if(
+        lastBeat >
+        0
+      )
+      {
+
+        unsigned long delta =
+          now -
+          lastBeat;
+
+
+        float newBPM =
+          60000.0 /
+          (float)delta;
+
+
+        if(
+          newBPM >= 25 &&
+          newBPM <= 200
+        )
+        {
+
+          currentBPM =
+            newBPM;
+
+
+          validBeatCount++;
+
+
+          // =============================================
+          // DISPLAY FILTER
+          // =============================================
+
+          if(
+            displayBPM ==
+            0
+          )
+          {
+
+            displayBPM =
+              newBPM;
+
+          }
+          else
+          {
+
+            displayBPM =
+              (
+                0.65 *
+                displayBPM
+              )
+              +
+              (
+                0.35 *
+                newBPM
+              );
+
+          }
+
+
+          // =============================================
+          // LOW HR ALERT
+          // =============================================
+
+          if(
+            newBPM <
+            HR_LOW_LIMIT
+          )
+          {
+
+            if(
+              lowBeatCount <
+              255
+            )
+            {
+
+              lowBeatCount++;
+
+            }
+
+
+            highBeatCount =
+              0;
+
+
+            normalBeatCount =
+              0;
+
+
+            if(
+              lowBeatCount >=
+              ABNORMAL_BEATS_REQUIRED
+            )
+            {
+
+              lowHRAlert =
+                true;
+
+
+              highHRAlert =
+                false;
+
+            }
+
+          }
+
+
+          // =============================================
+          // HIGH HR ALERT
+          // =============================================
+
+          else if(
+            newBPM >
+            HR_HIGH_LIMIT
+          )
+          {
+
+            if(
+              highBeatCount <
+              255
+            )
+            {
+
+              highBeatCount++;
+
+            }
+
+
+            lowBeatCount =
+              0;
+
+
+            normalBeatCount =
+              0;
+
+
+            if(
+              highBeatCount >=
+              ABNORMAL_BEATS_REQUIRED
+            )
+            {
+
+              highHRAlert =
+                true;
+
+
+              lowHRAlert =
+                false;
+
+            }
+
+          }
+
+
+          // =============================================
+          // NORMAL HR
+          // =============================================
+
+          else
+          {
+
+            lowBeatCount =
+              0;
+
+
+            highBeatCount =
+              0;
+
+
+            if(
+              normalBeatCount <
+              255
+            )
+            {
+
+              normalBeatCount++;
+
+            }
+
+
+            if(
+              normalBeatCount >=
+              NORMAL_BEATS_TO_CLEAR
+            )
+            {
+
+              lowHRAlert =
+                false;
+
+
+              highHRAlert =
+                false;
+
+            }
+
+          }
+
+
+          Serial.print(
+            "HR Raw: "
+          );
+
+
+          Serial.print(
+            currentBPM,
+            1
+          );
+
+
+          Serial.print(
+            " | Display: "
+          );
+
+
+          Serial.println(
+            displayBPM,
+            1
+          );
+
+        }
+
+      }
+
+
+      lastBeat =
+        now;
+
+    }
+
+  }
+
+  else
+  {
+
+    lastBeat =
+      0;
+
+
+    currentBPM =
+      0;
+
+
+    displayBPM =
+      0;
+
+
+    validBeatCount =
+      0;
+
+
+    lowBeatCount =
+      0;
+
+
+    highBeatCount =
+      0;
+
+
+    normalBeatCount =
+      0;
+
+
+    lowHRAlert =
+      false;
+
+
+    highHRAlert =
+      false;
+
+  }
+
+
+  // ===================================================
+  // KY-001 TEMPERATURE
+  // ===================================================
+
+  if(
+    tempConversionStarted
+  )
+  {
+
+    if(
+      millis() -
+      lastTempRequest >=
+      200
+    )
+    {
+
+      float newTemperature =
+        tempSensor.getTempCByIndex(
+          0
+        );
+
+
+      if(
+        newTemperature !=
+        DEVICE_DISCONNECTED_C
+      )
+      {
+
+        temperatureC =
+          newTemperature;
+
+
+        temperatureValid =
+          true;
+
+      }
+      else
+      {
+
+        temperatureValid =
+          false;
+
+      }
+
+
+      tempConversionStarted =
+        false;
+
+    }
+
+  }
+
+
+  if(
+    !tempConversionStarted
+    &&
+    millis() -
+    lastTempRequest >=
+    2000
+  )
+  {
+
+    tempSensor.requestTemperatures();
+
+
+    lastTempRequest =
+      millis();
+
+
+    tempConversionStarted =
+      true;
+
+  }
+
+
+  // ===================================================
+  // TEMPERATURE ALERT
+  // ===================================================
+
+  tempAlert =
+    temperatureValid
+    &&
+    temperatureC >
+    TEMP_HIGH_LIMIT;
+
+
+  // ===================================================
+  // OLED
+  // ===================================================
+
+  if(
+    millis() -
+    lastDisplayUpdate >=
+    250
+  )
+  {
+
+    lastDisplayUpdate =
+      millis();
+
+
+    display.clearDisplay();
+
+
+    display.setTextColor(
+      SSD1306_WHITE
+    );
+
+
+    // =================================================
+    // ALERT DISPLAY
+    // =================================================
+
+    if(
+      tempAlert ||
+      lowHRAlert ||
+      highHRAlert
+    )
+    {
+
+      display.setTextSize(
+        2
+      );
+
+
+      display.setCursor(
+        29,
+        0
+      );
+
+
+      display.println(
+        "ALERT"
+      );
+
+
+      display.setTextSize(
+        1
+      );
+
+
+      if(
+        lowHRAlert
+      )
+      {
+
+        display.setCursor(
+          0,
+          22
+        );
+
+
+        display.println(
+          "LOW HEART RATE"
+        );
+
+      }
+
+
+      if(
+        highHRAlert
+      )
+      {
+
+        display.setCursor(
+          0,
+          22
+        );
+
+
+        display.println(
+          "HIGH HEART RATE"
+        );
+
+      }
+
+
+      if(
+        tempAlert
+      )
+      {
+
+        display.setCursor(
+          0,
+          34
+        );
+
+
+        display.print(
+          "HIGH TEMP: "
+        );
+
+
+        display.print(
+          temperatureC,
+          1
+        );
+
+
+        display.print(
+          " C"
+        );
+
+      }
+
+
+      display.setCursor(
+        0,
+        51
+      );
+
+
+      display.print(
+        "HR:"
+      );
+
+
+      display.print(
+        currentBPM,
+        0
+      );
+
+
+      display.print(
+        " GPS:"
+      );
+
+
+      display.print(
+        gpsFix
+        ?
+        "FIX"
+        :
+        "NO"
+      );
+
+    }
+
+
+    // =================================================
+    // NORMAL DISPLAY
+    // =================================================
+
+    else
+    {
+
+      display.setTextSize(
+        1
+      );
+
+
+      display.setCursor(
+        17,
+        0
+      );
+
+
+      display.println(
+        "HEALTH MONITOR"
+      );
+
+
+      display.drawLine(
+        0,
+        11,
+        127,
+        11,
+        SSD1306_WHITE
+      );
+
+
+      display.setCursor(
+        0,
+        17
+      );
+
+
+      display.print(
+        "Heart Rate:"
+      );
+
+
+      if(
+        !fingerDetected
+      )
+      {
+
+        display.setCursor(
+          20,
+          29
+        );
+
+
+        display.print(
+          "PLACE FINGER"
+        );
+
+      }
+
+      else if(
+        validBeatCount <
+        2
+      )
+      {
+
+        display.setCursor(
+          20,
+          29
+        );
+
+
+        display.print(
+          "MEASURING..."
+        );
+
+      }
+
+      else
+      {
+
+        display.setTextSize(
+          2
+        );
+
+
+        display.setCursor(
+          20,
+          25
+        );
+
+
+        display.print(
+          displayBPM,
+          0
+        );
+
+
+        display.setTextSize(
+          1
+        );
+
+
+        display.print(
+          " BPM"
+        );
+
+      }
+
+
+      display.setTextSize(
+        1
+      );
+
+
+      display.setCursor(
+        0,
+        46
+      );
+
+
+      display.print(
+        "Temp:"
+      );
+
+
+      if(
+        temperatureValid
+      )
+      {
+
+        display.print(
+          temperatureC,
+          1
+        );
+
+
+        display.print(
+          "C"
+        );
+
+      }
+      else
+      {
+
+        display.print(
+          "--"
+        );
+
+      }
+
+
+      display.setCursor(
+        78,
+        46
+      );
+
+
+      display.print(
+        "GPS:"
+      );
+
+
+      display.print(
+        gpsFix
+        ?
+        "FIX"
+        :
+        "NO"
+      );
+
+
+      display.setCursor(
+        0,
+        56
+      );
+
+
+      display.print(
+        "Sat:"
+      );
+
+
+      display.print(
+        gpsSatellites
+      );
+
+    }
+
+
+    display.display();
+
+  }
+
+}
